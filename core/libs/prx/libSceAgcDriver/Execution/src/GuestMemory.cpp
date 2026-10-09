@@ -1099,10 +1099,21 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     // reset, so a probe pass first (which doubled the walk of every dirty range) buys nothing.
     // APS5_NO_SINGLE_PASS_COLLECT=1 restores the probe pass followed by a resetting pass when dirty.
     static const bool singlePass = std::getenv("APS5_NO_SINGLE_PASS_COLLECT") == nullptr;
+    // The result buffer offered to the kernel is bounded by the pages the range can report:
+    // GetWriteWatch's cost grows with the offered count as well as with the range (about 7 us for
+    // 65536 entries whatever the range, against well under 1 us for a small range with a matching
+    // buffer), and most walks cover a few dozen pages. APS5_FULL_COLLECT_BUFFER=1 offers the whole
+    // buffer as before.
+    static const bool fullBuffer = std::getenv("APS5_FULL_COLLECT_BUFFER") != nullptr;
+    const auto offered = [&](std::uint64_t from) {
+        if (fullBuffer) return tracker.pages.size();
+        return static_cast<std::size_t>(std::min<std::uint64_t>(tracker.pages.size(), (stop - (from & ~(page - 1)) + page - 1) / page));
+    };
     auto cursor = first;
     bool dirty = false;
     while (cursor < stop) {
-        std::size_t count = tracker.pages.size();
+        const std::size_t capacity = offered(cursor);
+        std::size_t count = capacity;
         DWORD granularity = 4096;
         if (!GuestArena::GuestArenaCollectWrites_nid_postfix(cursor, static_cast<std::size_t>(stop - cursor), tracker.pages.data(), &count, singlePass)) {
             // Uncommitted pages inside the range make the call fail; such ranges are compared instead.
@@ -1110,7 +1121,7 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
         }
         if (count != 0) dirty = true;
         for (ULONG_PTR i = 0; i < count; ++i) tracker.stamp(tracker.blockOf(reinterpret_cast<std::uintptr_t>(tracker.pages[i])), tracker.generation, kind);
-        if (count < tracker.pages.size()) break;
+        if (count < capacity) break;
         cursor = reinterpret_cast<std::uintptr_t>(tracker.pages[count - 1]) + (granularity != 0 ? granularity : page);
     }
     if (dirty) collectDirty.fetch_add(1, std::memory_order_relaxed);
@@ -1118,11 +1129,12 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
         // The resetting pass reports pages again, so a write racing the first pass is stamped too.
         cursor = first;
         while (cursor < stop) {
-            std::size_t count = tracker.pages.size();
+            const std::size_t capacity = offered(cursor);
+            std::size_t count = capacity;
             DWORD granularity = 4096;
             if (!GuestArena::GuestArenaCollectWrites_nid_postfix(cursor, static_cast<std::size_t>(stop - cursor), tracker.pages.data(), &count, true)) return false;
             for (ULONG_PTR i = 0; i < count; ++i) tracker.stamp(tracker.blockOf(reinterpret_cast<std::uintptr_t>(tracker.pages[i])), tracker.generation, kind);
-            if (count < tracker.pages.size()) break;
+            if (count < capacity) break;
             cursor = reinterpret_cast<std::uintptr_t>(tracker.pages[count - 1]) + (granularity != 0 ? granularity : page);
         }
     }
