@@ -1026,6 +1026,45 @@ struct ThreadCollectMemo {
 };
 thread_local ThreadCollectMemo threadCollectMemo;
 
+// The same memo without the ring's bound: every range the thread walked in its current epoch, kept
+// sorted, disjoint and merged, so a collect inside the walked ranges is found by one binary search.
+// A submission of several thousand draws collects far more than 64 distinct surfaces in one epoch;
+// the ring then forgets ranges it walked and walks them again, and on Windows a walk costs
+// GetWriteWatch time proportional to its pages. Ranges of an older epoch (or an older unwatch serial)
+// are dropped at the first walk of the new one. APS5_COLLECT_MEMO_RING=1 uses the ring as before.
+struct ThreadCollectRanges {
+    std::uint64_t epoch = 0;
+    std::uint64_t unwatched = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+
+    bool covers(std::uint64_t first, std::uint64_t stop) const {
+        auto next = std::upper_bound(ranges.begin(), ranges.end(), first, [](std::uint64_t value, const auto& range) { return value < range.first; });
+        return next != ranges.begin() && stop <= std::prev(next)->second;
+    }
+
+    void add(std::uint64_t first, std::uint64_t stop) {
+        auto at = std::lower_bound(ranges.begin(), ranges.end(), first, [](const auto& range, std::uint64_t value) { return range.second < value; });
+        auto last = at;
+        while (last != ranges.end() && last->first <= stop) {
+            first = std::min(first, last->first);
+            stop = std::max(stop, last->second);
+            ++last;
+        }
+        if (at == last) {
+            ranges.insert(at, {first, stop});
+            return;
+        }
+        *at = {first, stop};
+        ranges.erase(std::next(at), last);
+    }
+};
+thread_local ThreadCollectRanges threadCollectRanges;
+
+bool collectMemoRing() {
+    static const bool ring = std::getenv("APS5_COLLECT_MEMO_RING") != nullptr;
+    return ring;
+}
+
 bool newestCollectFirst() {
     static const bool enabled = std::getenv("APS5_SCAN_WHOLE_COLLECT_MEMO") == nullptr;
     return enabled;
@@ -1108,7 +1147,14 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     const auto epoch = currentCollectEpoch();
     const auto unwatched = unwatchSerial.load(std::memory_order_acquire);
     const bool useMemo = memoized && collectMemoEnabled() && bytes != 0;
-    if (useMemo && !sharedCollectMemo()) {
+    if (useMemo && !sharedCollectMemo() && !collectMemoRing()) {
+        // As below: a range is remembered only for a completed walk of an in-arena range.
+        const auto& walked = threadCollectRanges;
+        if (walked.epoch == epoch && walked.unwatched == unwatched && walked.covers(first, stop)) {
+            collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+            return tracker.generation.load(std::memory_order_relaxed);
+        }
+    } else if (useMemo && !sharedCollectMemo()) {
         // An entry exists only for a completed walk of an in-arena range, so the tracker is
         // initialized and watched; nothing below the lock needs asking.
         const auto count = threadCollectMemo.entries.size();
@@ -1142,7 +1188,15 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
         if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial};
-        else threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch, serial};
+        else if (!collectMemoRing()) {
+            auto& walked = threadCollectRanges;
+            if (walked.epoch != epoch || walked.unwatched != serial) {
+                walked.ranges.clear();
+                walked.epoch = epoch;
+                walked.unwatched = serial;
+            }
+            walked.add(first, stop);
+        } else threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch, serial};
     }
     return tracker.generation;
 }
